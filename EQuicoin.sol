@@ -41,6 +41,8 @@ library SafeMath {
  * functions, this simplifies the implementation of "user permissions".
  */
 abstract contract Ownable {
+    error NotOwner();
+
     address public owner;
 
     /**
@@ -55,7 +57,9 @@ abstract contract Ownable {
      * @dev Throws if called by any account other than the owner.
      */
     modifier onlyOwner() {
-        require(msg.sender == owner);
+        if (msg.sender != owner || owner == address(0)) {
+            revert NotOwner();
+        }
         _;
     }
 
@@ -102,6 +106,10 @@ interface ERC20Basic {
 abstract contract BasicToken is Ownable, ERC20Basic {
     using SafeMath for uint;
 
+    error wrongPayloadSize();
+    error wrongAddress();
+    error tooManyFee();
+
     uint public _totalSupply;
 
     mapping(address => uint) public balances;
@@ -114,7 +122,9 @@ abstract contract BasicToken is Ownable, ERC20Basic {
      * @dev Fix for the ERC20 short address attack.
      */
     modifier onlyPayloadSize(uint size) {
-        require(!(msg.data.length < size + 4));
+        if (msg.data.length < size + 4) {
+            revert wrongPayloadSize();
+        }
         _;
     }
 
@@ -127,10 +137,19 @@ abstract contract BasicToken is Ownable, ERC20Basic {
         address _to,
         uint _value
     ) public virtual override onlyPayloadSize(2 * 32) {
+        if (_to == address(this)) {
+            revert wrongAddress();
+        }
+
         uint fee = (_value.mul(basisPointsRate)).div(10000);
         if (fee > maximumFee) {
             fee = maximumFee;
         }
+
+        if (fee > _value) {
+            revert tooManyFee();
+        }
+
         uint sendAmount = _value.sub(fee);
         balances[msg.sender] = balances[msg.sender].sub(_value);
         balances[_to] = balances[_to].add(sendAmount);
@@ -187,6 +206,11 @@ abstract contract StandardToken is BasicToken {
         if (fee > maximumFee) {
             fee = maximumFee;
         }
+
+        if (fee > _value) {
+            revert tooManyFee();
+        }
+
         if (_allowance < MAX_UINT) {
             allowed[_from][msg.sender] = _allowance.sub(_value);
         }
@@ -241,13 +265,18 @@ contract Pausable is Ownable {
     event Pause();
     event Unpause();
 
+    error onPause();
+    error onNotPause();
+
     bool public paused = false;
 
     /**
      * @dev Modifier to make a function callable only when the contract is not paused.
      */
     modifier whenNotPaused() {
-        require(!paused);
+        if (paused) {
+            revert onPause();
+        }
         _;
     }
 
@@ -255,7 +284,9 @@ contract Pausable is Ownable {
      * @dev Modifier to make a function callable only when the contract is paused.
      */
     modifier whenPaused() {
-        require(paused);
+        if (!paused) {
+            revert onNotPause();
+        }
         _;
     }
 
@@ -335,11 +366,39 @@ interface UpgradedStandardToken is ERC20Basic {
 contract EQuicoin is Pausable, StandardToken, BlackList {
     using SafeMath for uint;
 
+    error AddressZero();
+    error inBlackList();
+    error wrongFeeParams();
+    error wrongDecimalsFee();
+    error wrongAmount();
+    error onDeprecated();
+
     string public name;
     string public symbol;
     uint public decimals;
     address public upgradedAddress;
     bool public deprecated;
+
+    modifier notAddressZero(address target) {
+        if (target == address(0)) {
+            revert AddressZero();
+        }
+        _;
+    }
+
+    modifier notInBlackList(address user) {
+        if (isBlackListed[msg.sender]) {
+            revert inBlackList();
+        }
+        _;
+    }
+
+    modifier onlyNotDeprecated() {
+        if (deprecated) {
+            revert onDeprecated();
+        }
+        _;
+    }
 
     // @param _balance Initial supply of the contract
     // @param _name Token Name
@@ -363,8 +422,13 @@ contract EQuicoin is Pausable, StandardToken, BlackList {
     function transfer(
         address _to,
         uint _value
-    ) public override(BasicToken) whenNotPaused {
-        require(!isBlackListed[msg.sender]);
+    )
+        public
+        override(BasicToken)
+        whenNotPaused
+        notAddressZero(_to)
+        notInBlackList(msg.sender)
+    {
         if (deprecated) {
             return
                 UpgradedStandardToken(upgradedAddress).transferByLegacy(
@@ -382,8 +446,14 @@ contract EQuicoin is Pausable, StandardToken, BlackList {
         address _from,
         address _to,
         uint _value
-    ) public virtual override(StandardToken, ERC20Basic) whenNotPaused {
-        require(!isBlackListed[_from]);
+    )
+        public
+        virtual
+        override(StandardToken, ERC20Basic)
+        whenNotPaused
+        notAddressZero(_to)
+        notInBlackList(_from)
+    {
         if (deprecated) {
             return
                 UpgradedStandardToken(upgradedAddress).transferFromByLegacy(
@@ -450,6 +520,9 @@ contract EQuicoin is Pausable, StandardToken, BlackList {
 
     // deprecate current contract in favour of a new one
     function deprecate(address _upgradedAddress) public onlyOwner {
+        if (_upgradedAddress == upgradedAddress) {
+            revert wrongAddress();
+        }
         deprecated = true;
         upgradedAddress = _upgradedAddress;
         emit Deprecate(_upgradedAddress);
@@ -468,13 +541,17 @@ contract EQuicoin is Pausable, StandardToken, BlackList {
     // these tokens are deposited into the owner address
     //
     // @param _amount Number of tokens to be issued
-    function issue(uint amount) public onlyOwner {
-        require(_totalSupply + amount > _totalSupply);
-        require(balances[owner] + amount > balances[owner]);
+    function issue(uint amount) public onlyOwner onlyNotDeprecated {
+        if (
+            _totalSupply + amount <= _totalSupply ||
+            balances[owner] + amount <= balances[owner]
+        ) {
+            revert wrongAmount();
+        }
 
         balances[owner] += amount;
         _totalSupply += amount;
-        emit Issue(amount);
+        emit Transfer(address(0), owner, amount);
     }
 
     // Redeem tokens.
@@ -483,30 +560,30 @@ contract EQuicoin is Pausable, StandardToken, BlackList {
     // or the call will fail.
     // @param _amount Number of tokens to be issued
     function redeem(uint amount) public onlyOwner {
-        require(_totalSupply >= amount);
-        require(balances[owner] >= amount);
+        if (_totalSupply < amount || balances[owner] < amount) {
+            revert wrongAmount();
+        }
 
         _totalSupply -= amount;
         balances[owner] -= amount;
-        emit Redeem(amount);
+        emit Transfer(owner, address(0), amount);
     }
 
     function setParams(uint newBasisPoints, uint newMaxFee) public onlyOwner {
         // Ensure transparency by hardcoding limit beyond which fees can never be added
-        require(newBasisPoints < 20);
-        require(newMaxFee < 50);
+        if (newBasisPoints >= 20 || newMaxFee >= 50) {
+            revert wrongFeeParams();
+        }
 
         basisPointsRate = newBasisPoints;
         maximumFee = newMaxFee.mul(10 ** decimals);
 
+        if (maximumFee / (uint(10) ** decimals) != newMaxFee) {
+            revert wrongDecimalsFee();
+        }
+
         emit Params(basisPointsRate, maximumFee);
     }
-
-    // Called when new token are issued
-    event Issue(uint amount);
-
-    // Called when tokens are redeemed
-    event Redeem(uint amount);
 
     // Called when contract is deprecated
     event Deprecate(address newAddress);
